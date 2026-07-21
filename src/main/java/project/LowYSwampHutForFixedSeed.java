@@ -9,6 +9,10 @@ import java.util.*;
 import java.util.List;
 import java.util.function.Consumer;
 import java.text.MessageFormat;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ThreadPoolExecutor;
 
 public class LowYSwampHutForFixedSeed extends JFrame {
     // ResourceBundle for internationalization
@@ -108,7 +112,8 @@ public class LowYSwampHutForFixedSeed extends JFrame {
     private JLabel listSearchRemainingTimeLabel;
     private JLabel listSearchCurrentSeedProgressLabel;
     private JTextArea listSearchResultArea;
-    private SearchCoords listSearcher;
+    private final Set<SearchCoords> activeListSearchers = Collections.synchronizedSet(new HashSet<>());
+    private ThreadPoolExecutor listSearchExecutor;
     private volatile boolean isListSearchRunning = false;
     private volatile boolean isListSearchPaused = false;
     private int lastListSearchMinX = 0;
@@ -1979,8 +1984,13 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                     maxX != lastListSearchMaxX || minZ != lastListSearchMinZ || maxZ != lastListSearchMaxZ ||
                     maxHeight != lastListSearchMaxHeight) {
                 // 停止当前搜索
-                if (listSearcher != null) {
-                    listSearcher.stop();
+                synchronized (activeListSearchers) {
+                    for (SearchCoords s : activeListSearchers) {
+                        s.stop();
+                    }
+                }
+                if (listSearchExecutor != null) {
+                    listSearchExecutor.shutdownNow();
                 }
                 isListSearchRunning = false;
                 isListSearchPaused = false;
@@ -2076,21 +2086,17 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                     }
                 }
 
-                // 如果线程数变化，调整线程数（不弹框，不清除进度）
-                if (threadCount != lastListSearchThreadCount) {
-                    // 获取版本参数
-                    String selectedVersion = (String) listVersionComboBox.getSelectedItem();
-                    GameVersion gameVersion = GameVersion.fromDisplayName(selectedVersion);
-                    WorldPresetMode worldPresetMode = getWorldPresetMode((String) listWorldPresetComboBox.getSelectedItem());
-
-                    // 如果版本变化，需要重新创建searcher
-                    if (listSearcher == null || !listSearcher.getGameVersion().equals(gameVersion) || listSearcher.getWorldPresetMode() != worldPresetMode) {
-                        listSearcher = new SearchCoords(gameVersion, worldPresetMode);
-                    }
+                // 调整线程池大小
+                if (threadCount != lastListSearchThreadCount && listSearchExecutor != null) {
+                    listSearchExecutor.setCorePoolSize(threadCount);
+                    listSearchExecutor.setMaximumPoolSize(threadCount);
                 }
-                // 恢复
-                if (listSearcher != null) {
-                    listSearcher.resume();
+                
+                // 恢复所有正在运行的 searcher
+                synchronized (activeListSearchers) {
+                    for (SearchCoords s : activeListSearchers) {
+                        s.resume();
+                    }
                 }
                 isListSearchPaused = false;
                 listSearchPauseButton.setText(getString("button.pause"));
@@ -2352,10 +2358,8 @@ public class LowYSwampHutForFixedSeed extends JFrame {
             progressMonitorThread.start();
 
             new Thread(() -> {
-                // 当前种子进度刷新节流：间隔不小于默认 100ms
-                final long[] lastSeedProgressUpdateTime = {0};
+                listSearchExecutor = (ThreadPoolExecutor) Executors.newFixedThreadPool(finalThreadCount);
                 final long[] lastTotalProgressUpdateTime = {0};
-                final long SEED_PROGRESS_UPDATE_INTERVAL_MS = 100;
 
                 for (int seedIndex = 0; seedIndex < seeds.size(); seedIndex++) {
                     if (!isListSearchRunning) {
@@ -2363,91 +2367,67 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                     }
 
                     final long seed = seeds.get(seedIndex);
-                    final int currentSeedIndex = seedIndex + 1; // 当前种子序号（从1开始）
-                    // 新种子开始：允许立即刷新一次当前种子进度
-                    lastSeedProgressUpdateTime[0] = 0;
-
                     seedResults.put(seed, new ArrayList<>());
 
-                    listSearcher = new SearchCoords(gameVersion, worldPresetMode);
+                    listSearchExecutor.submit(() -> {
+                        if (!isListSearchRunning) return;
 
-                    // 创建结果回调，按种子分组
-                    Consumer<String> seedResultCallback = result -> seedResults.get(seed).add(result);
+                        SearchCoords searcher = new SearchCoords(gameVersion, worldPresetMode);
+                        if (isListSearchPaused) searcher.pause();
+                        activeListSearchers.add(searcher);
 
-                    // 创建进度回调，更新当前种子的进度
-                    Consumer<SearchCoords.ProgressInfo> seedProgressCallback = info -> {
-                        long now = System.currentTimeMillis();
-                        if (now - lastSeedProgressUpdateTime[0] < SEED_PROGRESS_UPDATE_INTERVAL_MS) {
+                        Consumer<String> seedResultCallback = result -> seedResults.get(seed).add(result);
+                        boolean checkGeneration = isListSearchPreciseGenerationCheckEffective();
+
+                        // 1 thread per seed internally, since we parallelize across seeds
+                        searcher.startSearch(seed, 1, minX, maxX, minZ, maxZ, maxHeight,
+                                null, seedResultCallback, checkGeneration);
+
+                        if (isListSearchRunning) {
+                            searcher.awaitCompletion();
+                        }
+
+                        activeListSearchers.remove(searcher);
+
+                        if (!isListSearchRunning) {
                             return;
                         }
-                        lastSeedProgressUpdateTime[0] = now;
 
-                        long total = info.total();
-                        long processed = info.processed();
-                        double percentage = info.percentage();
+                        final int completedSeeds = processedSeedsRef.incrementAndGet();
 
-                        // 百分比不得超过 100%；若超过 100%，分子也强制显示为分母
-                        long displayProcessed;
-                        double displayPercentage;
-                        if (total > 0 && (percentage > 100.0 || processed > total)) {
-                            displayProcessed = total;
-                            displayPercentage = 100.0;
-                        } else {
-                            displayProcessed = total > 0 ? Math.min(processed, total) : processed;
-                            displayPercentage = Math.min(100.0, percentage);
+                        // 更新进度条：完成种子数/总种子数 (节流)
+                        final double percentage = (double) completedSeeds / totalSeeds * 100.0;
+                        final long currentLoopTime = System.currentTimeMillis();
+                        if (currentLoopTime - lastTotalProgressUpdateTime[0] >= 100 || completedSeeds == totalSeeds) {
+                            lastTotalProgressUpdateTime[0] = currentLoopTime;
+                            SwingUtilities.invokeLater(() -> {
+                                listSearchProgressBar.setValue(completedSeeds);
+                                listSearchProgressBar.setString(getString("progress.total", completedSeeds, totalSeeds, percentage));
+                                listSearchCurrentSeedProgressLabel.setText(String.format("Concurrent Processing (Threads: %d)", listSearchExecutor.getCorePoolSize()));
+                            });
                         }
 
-                        final long finalDisplayProcessed = displayProcessed;
-                        final long finalTotal = total;
-                        final double finalDisplayPercentage = displayPercentage;
-                        SwingUtilities.invokeLater(() -> {
-                            if (isListSearchRunning) {
-                                listSearchCurrentSeedProgressLabel.setText(
-                                        getString("currentSeed", currentSeedIndex, totalSeeds, finalDisplayProcessed, finalTotal, finalDisplayPercentage)
-                                );
-                            }
-                        });
-                    };
+                        // 输出当前种子的结果（如果有满足条件的女巫小屋）
+                        List<String> results = seedResults.get(seed);
+                        if (!results.isEmpty()) {
+                            SwingUtilities.invokeLater(() -> {
+                                listSearchResultArea.append(seed + "\n");
+                                for (String result : results) {
+                                    listSearchResultArea.append(result + "\n");
+                                }
+                                listSearchResultArea.setCaretPosition(listSearchResultArea.getDocument().getLength());
+                            });
+                        }
+                    });
+                }
 
-                    // 检查当前种子对应区域有无满足条件的女巫小屋
-                    boolean checkGeneration = isListSearchPreciseGenerationCheckEffective();
-                    listSearcher.startSearch(seed, finalThreadCount, minX, maxX, minZ, maxZ, maxHeight,
-                            seedProgressCallback, seedResultCallback, checkGeneration);
-
-                    // 等待当前种子搜索完成
-                    if (isListSearchRunning) {
-                        listSearcher.awaitCompletion();
+                listSearchExecutor.shutdown();
+                try {
+                    while (isListSearchRunning && !listSearchExecutor.awaitTermination(200, TimeUnit.MILLISECONDS)) {
+                        // wait until finished or stopped
                     }
-
-                    // 如果点击了停止，不把当前种子计入“已完成”，也不触发后续 UI 的完成态更新
-                    if (!isListSearchRunning) {
-                        break;
-                    }
-
-                    final int completedSeeds = processedSeedsRef.incrementAndGet();
-
-                    // 更新进度条：完成种子数/总种子数 (节流)
-                    final double percentage = (double) completedSeeds / totalSeeds * 100.0;
-                    final long currentLoopTime = System.currentTimeMillis();
-                    if (currentLoopTime - lastTotalProgressUpdateTime[0] >= 100 || completedSeeds == totalSeeds) {
-                        lastTotalProgressUpdateTime[0] = currentLoopTime;
-                        SwingUtilities.invokeLater(() -> {
-                            listSearchProgressBar.setValue(completedSeeds);
-                            listSearchProgressBar.setString(getString("progress.total", completedSeeds, totalSeeds, percentage));
-                        });
-                    }
-
-                    // 输出当前种子的结果（如果有满足条件的女巫小屋）
-                    List<String> results = seedResults.get(seed);
-                    if (!results.isEmpty()) {
-                        SwingUtilities.invokeLater(() -> {
-                            listSearchResultArea.append(seed + "\n");
-                            for (String result : results) {
-                                listSearchResultArea.append(result + "\n");
-                            }
-                            listSearchResultArea.setCaretPosition(listSearchResultArea.getDocument().getLength());
-                        });
-                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
 
                 // 若已停止：保持界面停留在“正常显示”的最后一帧，不进入“已完成”状态
@@ -2495,19 +2475,27 @@ public class LowYSwampHutForFixedSeed extends JFrame {
     }
 
     private void toggleListSearchPause() {
-        if (listSearcher == null || !isListSearchRunning) {
+        if (!isListSearchRunning) {
             return;
         }
 
         if (isListSearchPaused) {
-            // 恢复（线程数变化会在startListSearch中处理）
-            listSearcher.resume();
+            // 恢复
+            synchronized (activeListSearchers) {
+                for (SearchCoords s : activeListSearchers) {
+                    s.resume();
+                }
+            }
             isListSearchPaused = false;
             listSearchPauseButton.setText(getString("button.pause"));
             listSearchThreadCountField.setEnabled(false); // 恢复后不能修改线程数
         } else {
             // 暂停
-            listSearcher.pause();
+            synchronized (activeListSearchers) {
+                for (SearchCoords s : activeListSearchers) {
+                    s.pause();
+                }
+            }
             isListSearchPaused = true;
             listSearchPauseButton.setText(getString("button.resume"));
             listSearchThreadCountField.setEnabled(true); // 暂停时可以修改线程数
@@ -2515,8 +2503,13 @@ public class LowYSwampHutForFixedSeed extends JFrame {
     }
 
     private void stopListSearch() {
-        if (listSearcher != null) {
-            listSearcher.stop();
+        synchronized (activeListSearchers) {
+            for (SearchCoords s : activeListSearchers) {
+                s.stop();
+            }
+        }
+        if (listSearchExecutor != null) {
+            listSearchExecutor.shutdownNow();
         }
         isListSearchRunning = false;
         isListSearchPaused = false;
