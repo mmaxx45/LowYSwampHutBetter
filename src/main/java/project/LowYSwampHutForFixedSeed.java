@@ -258,7 +258,7 @@ public class LowYSwampHutForFixedSeed extends JFrame {
         gbc.gridx = 1;
         gbc.fill = GridBagConstraints.HORIZONTAL;
         gbc.weightx = 1.0;
-        String[] heightOptions = {"0", "-10", "-20", "-30", "-40"};
+        String[] heightOptions = {"0", "-10", "-20", "-30", "-40", "-54"};
         maxHeightComboBox = new JComboBox<>(heightOptions);
         maxHeightComboBox.setSelectedIndex(4); // 默认选择 -40
         inputPanel.add(maxHeightComboBox, gbc);
@@ -1141,7 +1141,7 @@ public class LowYSwampHutForFixedSeed extends JFrame {
         gbc.gridx = 1;
         gbc.fill = GridBagConstraints.HORIZONTAL;
         gbc.weightx = 1.0;
-        String[] heightOptions = {"0", "-10", "-20", "-30", "-40"};
+        String[] heightOptions = {"0", "-10", "-20", "-30", "-40", "-54"};
         listMaxHeightComboBox = new JComboBox<>(heightOptions);
         listMaxHeightComboBox.setSelectedIndex(4); // 默认选择 -40
         inputPanel.add(listMaxHeightComboBox, gbc);
