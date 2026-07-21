@@ -2296,6 +2296,7 @@ public class LowYSwampHutForFixedSeed extends JFrame {
             // 暂停时间跟踪
             final long[] pausedTimeRef = {0}; // 累计暂停时间
             final long[] pauseStartTimeRef = {0}; // 暂停开始时间
+            final java.util.concurrent.atomic.AtomicInteger processedSeedsRef = new java.util.concurrent.atomic.AtomicInteger(0);
 
             // 启动进度监控线程，定期更新时间显示
             Thread progressMonitorThread = new Thread(() -> {
@@ -2324,10 +2325,10 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                             currentPausedTime += System.currentTimeMillis() - pauseStartTimeRef[0];
                         }
                         final long elapsedMs = System.currentTimeMillis() - startTime - currentPausedTime;
+                        final int currentProgress = processedSeedsRef.get();
 
                         // 获取当前完成的种子数（需要从UI获取或使用共享变量）
                         SwingUtilities.invokeLater(() -> {
-                            int currentProgress = listSearchProgressBar.getValue();
                             if (currentProgress > 0 && currentProgress < totalSeeds) {
                                 // 暂停时保持界面显示“正常的”时间/剩余时间（不覆盖为“已暂停”）
                                 if (isListSearchPaused) {
@@ -2351,9 +2352,9 @@ public class LowYSwampHutForFixedSeed extends JFrame {
             progressMonitorThread.start();
 
             new Thread(() -> {
-                final int[] processedSeedsRef = {0};
                 // 当前种子进度刷新节流：间隔不小于默认 100ms
                 final long[] lastSeedProgressUpdateTime = {0};
+                final long[] lastTotalProgressUpdateTime = {0};
                 final long SEED_PROGRESS_UPDATE_INTERVAL_MS = 100;
 
                 for (int seedIndex = 0; seedIndex < seeds.size(); seedIndex++) {
@@ -2423,16 +2424,18 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                         break;
                     }
 
-                    processedSeedsRef[0]++;
+                    final int completedSeeds = processedSeedsRef.incrementAndGet();
 
-                    // 更新进度条：完成种子数/总种子数
-                    final int completedSeeds = processedSeedsRef[0];
+                    // 更新进度条：完成种子数/总种子数 (节流)
                     final double percentage = (double) completedSeeds / totalSeeds * 100.0;
-
-                    SwingUtilities.invokeLater(() -> {
-                        listSearchProgressBar.setValue(completedSeeds);
-                        listSearchProgressBar.setString(getString("progress.total", completedSeeds, totalSeeds, percentage));
-                    });
+                    final long currentLoopTime = System.currentTimeMillis();
+                    if (currentLoopTime - lastTotalProgressUpdateTime[0] >= 100 || completedSeeds == totalSeeds) {
+                        lastTotalProgressUpdateTime[0] = currentLoopTime;
+                        SwingUtilities.invokeLater(() -> {
+                            listSearchProgressBar.setValue(completedSeeds);
+                            listSearchProgressBar.setString(getString("progress.total", completedSeeds, totalSeeds, percentage));
+                        });
+                    }
 
                     // 输出当前种子的结果（如果有满足条件的女巫小屋）
                     List<String> results = seedResults.get(seed);
