@@ -2414,25 +2414,8 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                             seedProgressCallback, seedResultCallback, checkGeneration);
 
                     // 等待当前种子搜索完成
-                    while (listSearcher.isRunning() && isListSearchRunning) {
-                        // 暂停时等待（暂停时间跟踪由进度监控线程处理）
-                        while (isListSearchPaused && isListSearchRunning) {
-                            try {
-                                Thread.sleep(100);
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                                return;
-                            }
-                        }
-                        if (!isListSearchRunning) {
-                            break;
-                        }
-                        try {
-                            Thread.sleep(100);
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
+                    if (isListSearchRunning) {
+                        listSearcher.awaitCompletion();
                     }
 
                     // 如果点击了停止，不把当前种子计入“已完成”，也不触发后续 UI 的完成态更新
