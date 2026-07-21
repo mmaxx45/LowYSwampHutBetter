@@ -116,41 +116,39 @@ public class SearchCoords {
         completion.whenCompleteAsync((v, ex) -> isRunning = false, SHARED_EXECUTOR);
 
         // 进度监控线程：只负责按 100ms 节奏刷新 UI 进度，不再用于探测“任务是否结束”
-        progressThread = new Thread(() -> {
-            while (isRunning && !completion.isDone()) {
-                try {
-                    Thread.sleep(100);
-                    long processed = processedCount.get();
-                    double percentage = (double) processed / totalTasks * 100.0;
+        if (progressCallback != null) {
+            progressThread = new Thread(() -> {
+                while (isRunning && !completion.isDone()) {
+                    try {
+                        Thread.sleep(100);
+                        long processed = processedCount.get();
+                        double percentage = (double) processed / totalTasks * 100.0;
 
-                    if (isPaused) {
-                        pauseStartTime.updateAndGet(start -> start == 0 ? System.currentTimeMillis() : start);
-                    } else {
-                        Long pauseStart = pauseStartTime.getAndSet(0L);
-                        if (pauseStart > 0) {
-                            pausedTime.addAndGet(System.currentTimeMillis() - pauseStart);
+                        if (isPaused) {
+                            pauseStartTime.updateAndGet(start -> start == 0 ? System.currentTimeMillis() : start);
+                        } else {
+                            Long pauseStart = pauseStartTime.getAndSet(0L);
+                            if (pauseStart > 0) {
+                                pausedTime.addAndGet(System.currentTimeMillis() - pauseStart);
+                            }
                         }
-                    }
 
-                    long elapsed = System.currentTimeMillis() - startTime - pausedTime.get();
-                    long remaining = processed > 0 ? (elapsed * (totalTasks - processed) / processed) : 0;
+                        long elapsed = System.currentTimeMillis() - startTime - pausedTime.get();
+                        long remaining = processed > 0 ? (elapsed * (totalTasks - processed) / processed) : 0;
 
-                    if (progressCallback != null) {
                         progressCallback.accept(new ProgressInfo(processed, totalTasks, percentage, elapsed, remaining));
+                    } catch (InterruptedException e) {
+                        break;
                     }
-                } catch (InterruptedException e) {
-                    break;
                 }
-            }
-            long processed = processedCount.get();
-            double percentage = (double) processed / totalTasks * 100.0;
-            long elapsed = System.currentTimeMillis() - startTime - pausedTime.get();
-            if (progressCallback != null) {
+                long processed = processedCount.get();
+                double percentage = (double) processed / totalTasks * 100.0;
+                long elapsed = System.currentTimeMillis() - startTime - pausedTime.get();
                 progressCallback.accept(new ProgressInfo(processed, totalTasks, percentage, elapsed, 0));
-            }
-        });
-        progressThread.setDaemon(true);
-        progressThread.start();
+            });
+            progressThread.setDaemon(true);
+            progressThread.start();
+        }
     }
 
     /**

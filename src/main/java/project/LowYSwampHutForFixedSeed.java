@@ -2367,7 +2367,6 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                     }
 
                     final long seed = seeds.get(seedIndex);
-                    seedResults.put(seed, new ArrayList<>());
 
                     listSearchExecutor.submit(() -> {
                         if (!isListSearchRunning) return;
@@ -2376,7 +2375,11 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                         if (isListSearchPaused) searcher.pause();
                         activeListSearchers.add(searcher);
 
-                        Consumer<String> seedResultCallback = result -> seedResults.get(seed).add(result);
+                        Consumer<String> seedResultCallback = result -> {
+                            synchronized (seedResults) {
+                                seedResults.computeIfAbsent(seed, k -> new ArrayList<>()).add(result);
+                            }
+                        };
                         boolean checkGeneration = isListSearchPreciseGenerationCheckEffective();
 
                         // 1 thread per seed internally, since we parallelize across seeds
@@ -2408,8 +2411,11 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                         }
 
                         // 输出当前种子的结果（如果有满足条件的女巫小屋）
-                        List<String> results = seedResults.get(seed);
-                        if (!results.isEmpty()) {
+                        List<String> results;
+                        synchronized (seedResults) {
+                            results = seedResults.get(seed);
+                        }
+                        if (results != null && !results.isEmpty()) {
                             SwingUtilities.invokeLater(() -> {
                                 listSearchResultArea.append(seed + "\n");
                                 for (String result : results) {
