@@ -61,6 +61,7 @@ public class SearchCoords {
     private Consumer<String> currentResultCallback;
     private int currentThreadCount;
     private boolean currentCheckGeneration;
+    private int[] currentInnerBox;
 
     // ================= 每线程每种子缓存（噪声采样器 + SeedChecker） =================
     private static final ThreadLocal<ThreadSeedResources> THREAD_RESOURCES = new ThreadLocal<>();
@@ -76,8 +77,8 @@ public class SearchCoords {
     }
 
     public void startSearch(long seed, int threadCount, int minX, int maxX, int minZ, int maxZ, double maxHeight,
-                            Consumer<ProgressInfo> progressCallback, Consumer<String> resultCallback, boolean checkGeneration) {
-        // 如果正在运行且处于暂停状态，且线程数变化，则调整线程数
+                            Consumer<ProgressInfo> progressCallback, Consumer<String> resultCallback, boolean checkGeneration,
+                            int[] innerBox) {
         if (isRunning && isPaused && threadCount != currentThreadCount) {
             adjustThreadCount(threadCount, resultCallback, checkGeneration);
             return;
@@ -102,6 +103,7 @@ public class SearchCoords {
         currentThreadCount = threadCount;
         currentResultCallback = resultCallback;
         currentCheckGeneration = checkGeneration;
+        currentInnerBox = innerBox;
 
         AtomicLong processedCount = new AtomicLong(0);
         currentProcessedCount = processedCount;
@@ -111,7 +113,7 @@ public class SearchCoords {
         AtomicReference<Long> pauseStartTime = new AtomicReference<>(0L);
 
         CompletableFuture<Void> completion = submitBatch(seed, threadCount, minX, maxX, minZ, maxZ, maxHeight,
-                processedCount, resultCallback, checkGeneration);
+                processedCount, resultCallback, checkGeneration, innerBox);
         currentCompletion = completion;
         completion.whenCompleteAsync((v, ex) -> isRunning = false, SHARED_EXECUTOR);
 
@@ -166,7 +168,7 @@ public class SearchCoords {
 
     private CompletableFuture<Void> submitBatch(long seed, int threadCount, int minX, int maxX, int minZ, int maxZ,
                                                  double maxHeight, AtomicLong processedCount,
-                                                 Consumer<String> resultCallback, boolean checkGeneration) {
+                                                 Consumer<String> resultCallback, boolean checkGeneration, int[] innerBox) {
         int totalX = maxX - minX;
         int chunkSize = Math.max(1, totalX / threadCount);
         List<CompletableFuture<Void>> futures = new ArrayList<>(threadCount);
@@ -174,7 +176,7 @@ public class SearchCoords {
         for (int i = 0; i < threadCount; i++) {
             int startX = minX + i * chunkSize;
             int endX = (i == threadCount - 1) ? maxX : startX + chunkSize;
-            RegionChecker task = new RegionChecker(seed, startX, endX, minZ, maxZ, maxHeight, processedCount, resultCallback, checkGeneration);
+            RegionChecker task = new RegionChecker(seed, startX, endX, minZ, maxZ, maxHeight, processedCount, resultCallback, checkGeneration, innerBox);
             futures.add(CompletableFuture.runAsync(task, SHARED_EXECUTOR));
         }
 
@@ -215,7 +217,7 @@ public class SearchCoords {
         currentCheckGeneration = checkGeneration;
 
         CompletableFuture<Void> completion = submitBatch(currentSeed, newThreadCount, currentMinX, currentMaxX,
-                currentMinZ, currentMaxZ, currentMaxHeight, currentProcessedCount, currentResultCallback, currentCheckGeneration);
+                currentMinZ, currentMaxZ, currentMaxHeight, currentProcessedCount, currentResultCallback, currentCheckGeneration, currentInnerBox);
         currentCompletion = completion;
         completion.whenCompleteAsync((v, ex) -> isRunning = false, SHARED_EXECUTOR);
 
@@ -257,8 +259,9 @@ public class SearchCoords {
         private final AtomicLong processedCount;
         private final Consumer<String> resultCallback;
         private final boolean checkGeneration;
+        private final int[] innerBox;
 
-        public RegionChecker(long seed, int startX, int endX, int minZ, int maxZ, double maxHeight, AtomicLong processedCount, Consumer<String> resultCallback, boolean checkGeneration) {
+        public RegionChecker(long seed, int startX, int endX, int minZ, int maxZ, double maxHeight, AtomicLong processedCount, Consumer<String> resultCallback, boolean checkGeneration, int[] innerBox) {
             this.seed = seed;
             this.startX = startX;
             this.endX = endX;
@@ -269,6 +272,7 @@ public class SearchCoords {
             this.processedCount = processedCount;
             this.resultCallback = resultCallback;
             this.checkGeneration = checkGeneration;
+            this.innerBox = innerBox;
         }
 
         @Override
@@ -278,6 +282,10 @@ public class SearchCoords {
             try {
                 for (int x = startX; x < endX && isRunning && !restartRequested; x++) {
                     for (int z = minZ; z < maxZ && isRunning && !restartRequested; z++) {
+                        if (innerBox != null && x >= innerBox[0] && x <= innerBox[1] && z >= innerBox[2] && z <= innerBox[3]) {
+                            processedCount.incrementAndGet();
+                            continue;
+                        }
                         while (isPaused && isRunning && !restartRequested) {
                             try {
                                 Thread.sleep(100);

@@ -94,6 +94,8 @@ public class LowYSwampHutForFixedSeed extends JFrame {
     private JComboBox<String> listMaxHeightComboBox;
     private JComboBox<String> listVersionComboBox;
     private JComboBox<String> listWorldPresetComboBox;
+    private JTextField listInnerBoxField;
+    private JButton expandRadiusButton;
     private JTextField listMinXField;
     private JTextField listMaxXField;
     private JTextField listMinZField;
@@ -794,7 +796,7 @@ public class LowYSwampHutForFixedSeed extends JFrame {
 
                     boolean checkGeneration = isSingleSeedPreciseGenerationCheckEffective();
                     searcher.startSearch(seed, threadCount, minX, maxX, minZ, maxZ, maxHeight,
-                            this::updateSearchProgress, this::addSearchResult, checkGeneration);
+                            this::updateSearchProgress, this::addSearchResult, checkGeneration, null);
 
                     lastSearchThreadCount = threadCount;
                 } else {
@@ -1018,7 +1020,7 @@ public class LowYSwampHutForFixedSeed extends JFrame {
 
             searcher = new SearchCoords(gameVersion, worldPresetMode);
             boolean checkGeneration = isSingleSeedPreciseGenerationCheckEffective();
-            searcher.startSearch(seed, threadCount, minX, maxX, minZ, maxZ, maxHeight, this::updateSearchProgress, this::addSearchResult, checkGeneration);
+            searcher.startSearch(seed, threadCount, minX, maxX, minZ, maxZ, maxHeight, this::updateSearchProgress, this::addSearchResult, checkGeneration, null);
 
         } catch (NumberFormatException e) {
             JOptionPane.showMessageDialog(this, getString("error.invalidNumber"), getString("prompt.error"), JOptionPane.ERROR_MESSAGE);
@@ -1258,9 +1260,48 @@ public class LowYSwampHutForFixedSeed extends JFrame {
         });
         inputPanel.add(listMaxZField, gbc);
 
-        // 精确检查生成情况复选框
+        // 新增：Inner Box
         gbc.gridx = 0;
         gbc.gridy = 9;
+        gbc.fill = GridBagConstraints.NONE;
+        gbc.weightx = 0;
+        JLabel innerBoxLabel = new JLabel(getString("label.innerBox"));
+        innerBoxLabel.setFont(getLoadedFont());
+        inputPanel.add(innerBoxLabel, gbc);
+
+        gbc.gridx = 1;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weightx = 1.0;
+        JPanel innerBoxPanel = new JPanel(new BorderLayout(5, 0));
+        listInnerBoxField = new JTextField(20);
+        listInnerBoxField.setFont(getLoadedFont());
+        innerBoxPanel.add(listInnerBoxField, BorderLayout.CENTER);
+        
+        expandRadiusButton = new JButton(getString("button.expandRadius"));
+        expandRadiusButton.setFont(getLoadedFont());
+        expandRadiusButton.addActionListener(e -> {
+            try {
+                int curMinX = Integer.parseInt(listMinXField.getText().trim());
+                int curMaxX = Integer.parseInt(listMaxXField.getText().trim());
+                int curMinZ = Integer.parseInt(listMinZField.getText().trim());
+                int curMaxZ = Integer.parseInt(listMaxZField.getText().trim());
+                
+                listInnerBoxField.setText(curMinX + "," + curMaxX + "," + curMinZ + "," + curMaxZ);
+                
+                listMinXField.setText(String.valueOf(curMinX - 5));
+                listMaxXField.setText(String.valueOf(curMaxX + 5));
+                listMinZField.setText(String.valueOf(curMinZ - 5));
+                listMaxZField.setText(String.valueOf(curMaxZ + 5));
+            } catch (Exception ex) {
+                // Ignore if currently invalid
+            }
+        });
+        innerBoxPanel.add(expandRadiusButton, BorderLayout.EAST);
+        inputPanel.add(innerBoxPanel, gbc);
+
+        // 精确检查生成情况复选框
+        gbc.gridx = 0;
+        gbc.gridy = 10;
         gbc.fill = GridBagConstraints.NONE;
         gbc.weightx = 0;
         listSearchCheckGenerationLabel = new JLabel(getString("label.checkGeneration"));
@@ -2008,6 +2049,8 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                 listMaxXField.setEnabled(true);
                 listMinZField.setEnabled(true);
                 listMaxZField.setEnabled(true);
+                listInnerBoxField.setEnabled(true);
+                expandRadiusButton.setEnabled(true);
                 updateListSearchPreciseGenerationCheckUi();
                 listSearchResultArea.setText("");
                 listSearchProgressBar.setValue(0);
@@ -2256,6 +2299,30 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                 return;
             }
 
+            // 解析 inner box
+            String innerBoxStr = listInnerBoxField.getText().trim();
+            int[] tempInnerBox = null;
+            if (!innerBoxStr.isEmpty()) {
+                String[] parts = innerBoxStr.split(",");
+                if (parts.length == 4) {
+                    try {
+                        tempInnerBox = new int[]{
+                                Integer.parseInt(parts[0].trim()),
+                                Integer.parseInt(parts[1].trim()),
+                                Integer.parseInt(parts[2].trim()),
+                                Integer.parseInt(parts[3].trim())
+                        };
+                    } catch (NumberFormatException e) {
+                        JOptionPane.showMessageDialog(this, getString("error.innerBoxFormat"), getString("prompt.error"), JOptionPane.ERROR_MESSAGE);
+                        return;
+                    }
+                } else {
+                    JOptionPane.showMessageDialog(this, getString("error.innerBoxFormat"), getString("prompt.error"), JOptionPane.ERROR_MESSAGE);
+                    return;
+                }
+            }
+            final int[] parsedInnerBox = tempInnerBox;
+
             // 保存当前参数
             lastListSearchMinX = minX;
             lastListSearchMaxX = maxX;
@@ -2280,6 +2347,8 @@ public class LowYSwampHutForFixedSeed extends JFrame {
             listMaxXField.setEnabled(false);
             listMinZField.setEnabled(false);
             listMaxZField.setEnabled(false);
+            listInnerBoxField.setEnabled(false);
+            expandRadiusButton.setEnabled(false);
             updateListSearchPreciseGenerationCheckUi();
             listSearchResultArea.setText("");
             listSearchProgressBar.setValue(0);
@@ -2393,7 +2462,7 @@ public class LowYSwampHutForFixedSeed extends JFrame {
 
                         // 1 thread per seed internally, since we parallelize across seeds
                         searcher.startSearch(seed, 1, minX, maxX, minZ, maxZ, maxHeight,
-                                null, seedResultCallback, checkGeneration);
+                                null, seedResultCallback, checkGeneration, parsedInnerBox);
 
                         if (isListSearchRunning) {
                             searcher.awaitCompletion();
@@ -2478,6 +2547,8 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                     listMaxXField.setEnabled(true);
                     listMinZField.setEnabled(true);
                     listMaxZField.setEnabled(true);
+                listInnerBoxField.setEnabled(true);
+                expandRadiusButton.setEnabled(true);
                     updateListSearchPreciseGenerationCheckUi();
                     listSearchProgressBar.setValue((int) totalSeeds);
                     listSearchProgressBar.setString(getString("progress.totalComplete", totalSeeds, totalSeeds));
