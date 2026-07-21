@@ -2360,16 +2360,25 @@ public class LowYSwampHutForFixedSeed extends JFrame {
             new Thread(() -> {
                 listSearchExecutor = (ThreadPoolExecutor) Executors.newFixedThreadPool(finalThreadCount);
                 final long[] lastTotalProgressUpdateTime = {0};
+                java.util.concurrent.Semaphore submissionThrottle = new java.util.concurrent.Semaphore(finalThreadCount * 2);
 
                 for (int seedIndex = 0; seedIndex < seeds.size(); seedIndex++) {
                     if (!isListSearchRunning) {
                         break;
                     }
 
+                    try {
+                        submissionThrottle.acquire();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+
                     final long seed = seeds.get(seedIndex);
 
                     listSearchExecutor.submit(() -> {
-                        if (!isListSearchRunning) return;
+                        try {
+                            if (!isListSearchRunning) return;
 
                         SearchCoords searcher = new SearchCoords(gameVersion, worldPresetMode);
                         if (isListSearchPaused) searcher.pause();
@@ -2424,7 +2433,10 @@ public class LowYSwampHutForFixedSeed extends JFrame {
                                 listSearchResultArea.setCaretPosition(listSearchResultArea.getDocument().getLength());
                             });
                         }
-                    });
+                    } finally {
+                        submissionThrottle.release();
+                    }
+                });
                 }
 
                 listSearchExecutor.shutdown();
