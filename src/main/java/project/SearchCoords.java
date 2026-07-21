@@ -18,24 +18,40 @@ import org.jetbrains.annotations.NotNull;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 
 public class SearchCoords {
+
+    // ================= 共享线程池（跨所有 SearchCoords 实例复用，避免每次搜索都创建/销毁线程） =================
+    // 缓存线程池：空闲线程会被复用，不会像 newFixedThreadPool 那样每次搜索都新建 OS 线程。
+    private static final AtomicInteger POOL_THREAD_COUNTER = new AtomicInteger();
+    private static final ThreadFactory DAEMON_THREAD_FACTORY = r -> {
+        Thread t = new Thread(r, "seed-search-worker-" + POOL_THREAD_COUNTER.incrementAndGet());
+        t.setDaemon(true);
+        return t;
+    };
+    private static final ExecutorService SHARED_EXECUTOR = Executors.newCachedThreadPool(DAEMON_THREAD_FACTORY);
 
     private final SwampHut swampHut;
     private final GameVersion gameVersion;
     private final MCVersion mcVersion;
     private final WorldPresetMode worldPresetMode;
-    private ExecutorService executor;
     private Thread progressThread;
     private volatile boolean isRunning = false;
     private volatile boolean isPaused = false;
+    // 用于在调整线程数时，让当前批次的任务尽快自行退出，而不必销毁/重建整个线程池
+    private volatile boolean restartRequested = false;
     private final List<String> results = new ArrayList<>();
+
+    // 当前搜索完成信号（替代原来对 executor.isTerminated() / awaitTermination 的轮询）
+    private volatile CompletableFuture<Void> currentCompletion = CompletableFuture.completedFuture(null);
 
     // 保存当前搜索状态，用于动态调整线程数
     private long currentSeed;
@@ -58,6 +74,7 @@ public class SearchCoords {
         this.worldPresetMode = worldPresetMode;
         this.swampHut = new SwampHut(mcVersion);
     }
+
     public void startSearch(long seed, int threadCount, int minX, int maxX, int minZ, int maxZ, double maxHeight,
                             Consumer<ProgressInfo> progressCallback, Consumer<String> resultCallback, boolean checkGeneration) {
         // 如果正在运行且处于暂停状态，且线程数变化，则调整线程数
@@ -70,6 +87,7 @@ public class SearchCoords {
             return;
         }
         isRunning = true;
+        restartRequested = false;
         results.clear();
 
         long totalTasks = (long) (maxX - minX) * (maxZ - minZ);
@@ -85,35 +103,35 @@ public class SearchCoords {
         currentResultCallback = resultCallback;
         currentCheckGeneration = checkGeneration;
 
-        executor = Executors.newFixedThreadPool(threadCount);
-        int totalX = maxX - minX;
-        int chunkSize = Math.max(1, totalX / threadCount);
         AtomicLong processedCount = new AtomicLong(0);
         currentProcessedCount = processedCount;
 
-        // 启动进度监控线程
         long startTime = System.currentTimeMillis();
-        AtomicLong pausedTime = new AtomicLong(0); // 累计暂停时间
-        AtomicReference<Long> pauseStartTime = new AtomicReference<>(0L); // 暂停开始时间
+        AtomicLong pausedTime = new AtomicLong(0);
+        AtomicReference<Long> pauseStartTime = new AtomicReference<>(0L);
+
+        CompletableFuture<Void> completion = submitBatch(seed, threadCount, minX, maxX, minZ, maxZ, maxHeight,
+                processedCount, resultCallback, checkGeneration);
+        currentCompletion = completion;
+        completion.whenCompleteAsync((v, ex) -> isRunning = false, SHARED_EXECUTOR);
+
+        // 进度监控线程：只负责按 100ms 节奏刷新 UI 进度，不再用于探测“任务是否结束”
         progressThread = new Thread(() -> {
-            while (isRunning && !executor.isTerminated()) {
+            while (isRunning && !completion.isDone()) {
                 try {
-                    Thread.sleep(100); // 每100ms更新一次
+                    Thread.sleep(100);
                     long processed = processedCount.get();
                     double percentage = (double) processed / totalTasks * 100.0;
 
-                    // 如果暂停，更新暂停时间
                     if (isPaused) {
                         pauseStartTime.updateAndGet(start -> start == 0 ? System.currentTimeMillis() : start);
                     } else {
-                        // 如果从暂停恢复，累计暂停时间
                         Long pauseStart = pauseStartTime.getAndSet(0L);
                         if (pauseStart > 0) {
                             pausedTime.addAndGet(System.currentTimeMillis() - pauseStart);
                         }
                     }
 
-                    // 计算实际已用时间（排除暂停时间）
                     long elapsed = System.currentTimeMillis() - startTime - pausedTime.get();
                     long remaining = processed > 0 ? (elapsed * (totalTasks - processed) / processed) : 0;
 
@@ -124,7 +142,6 @@ public class SearchCoords {
                     break;
                 }
             }
-            // 最终进度
             long processed = processedCount.get();
             double percentage = (double) processed / totalTasks * 100.0;
             long elapsed = System.currentTimeMillis() - startTime - pausedTime.get();
@@ -134,32 +151,42 @@ public class SearchCoords {
         });
         progressThread.setDaemon(true);
         progressThread.start();
+    }
+
+    /**
+     * 阻塞当前线程直到本次搜索完成——没有轮询、没有 sleep(100)，
+     * 一旦所有任务结束会立刻返回。适合批量种子搜索场景使用，
+     * 用它替代原来的 `while (isRunning()) Thread.sleep(100);`。
+     */
+    public void awaitCompletion() {
+        try {
+            currentCompletion.join();
+        } catch (Exception ignored) {
+            // 任务被取消/异常时忽略，isRunning 状态已经反映了结果
+        }
+    }
+
+    private CompletableFuture<Void> submitBatch(long seed, int threadCount, int minX, int maxX, int minZ, int maxZ,
+                                                 double maxHeight, AtomicLong processedCount,
+                                                 Consumer<String> resultCallback, boolean checkGeneration) {
+        int totalX = maxX - minX;
+        int chunkSize = Math.max(1, totalX / threadCount);
+        List<CompletableFuture<Void>> futures = new ArrayList<>(threadCount);
 
         for (int i = 0; i < threadCount; i++) {
             int startX = minX + i * chunkSize;
             int endX = (i == threadCount - 1) ? maxX : startX + chunkSize;
-            executor.execute(new RegionChecker(seed, startX, endX, minZ, maxZ, maxHeight, processedCount, resultCallback, checkGeneration));
+            RegionChecker task = new RegionChecker(seed, startX, endX, minZ, maxZ, maxHeight, processedCount, resultCallback, checkGeneration);
+            futures.add(CompletableFuture.runAsync(task, SHARED_EXECUTOR));
         }
-        executor.shutdown();
 
-        // 等待完成
-        new Thread(() -> {
-            try {
-                executor.awaitTermination(Long.MAX_VALUE, TimeUnit.SECONDS);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            } finally {
-                isRunning = false;
-            }
-        }).start();
+        return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]));
     }
 
     public void stop() {
         isRunning = false;
         isPaused = false;
-        if (executor != null) {
-            executor.shutdownNow();
-        }
+        restartRequested = true;
         if (progressThread != null) {
             progressThread.interrupt();
         }
@@ -173,45 +200,27 @@ public class SearchCoords {
         isPaused = false;
     }
 
-    // 动态调整线程数，保持进度继续
+    // 动态调整线程数，保持进度继续。任务是协作式退出的（检查 restartRequested），
+    // 不需要销毁/重建整个线程池——线程池本身是共享且常驻的。
     private void adjustThreadCount(int newThreadCount, Consumer<String> resultCallback, boolean checkGeneration) {
         if (newThreadCount < 1) {
             return;
         }
 
-        // 停止当前的 executor，并等待旧工作线程退出，避免与新建线程池并发争抢
-        if (executor != null && !executor.isShutdown()) {
-            executor.shutdownNow();
-            try {
-                if (!executor.awaitTermination(30, TimeUnit.SECONDS)) {
-                    return;
-                }
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                return;
-            }
-        }
+        // 让当前批次的任务尽快退出
+        restartRequested = true;
+        currentCompletion.join();
+        restartRequested = false;
 
-        // 更新线程数
         currentThreadCount = newThreadCount;
         currentResultCallback = resultCallback;
         currentCheckGeneration = checkGeneration;
 
-        // 创建新的executor
-        executor = Executors.newFixedThreadPool(newThreadCount);
-        int totalX = currentMaxX - currentMinX;
-        int chunkSize = Math.max(1, totalX / newThreadCount);
+        CompletableFuture<Void> completion = submitBatch(currentSeed, newThreadCount, currentMinX, currentMaxX,
+                currentMinZ, currentMaxZ, currentMaxHeight, currentProcessedCount, currentResultCallback, currentCheckGeneration);
+        currentCompletion = completion;
+        completion.whenCompleteAsync((v, ex) -> isRunning = false, SHARED_EXECUTOR);
 
-        // 重新分配任务（使用相同的进度计数器，保持进度）
-        for (int i = 0; i < newThreadCount; i++) {
-            int startX = currentMinX + i * chunkSize;
-            int endX = (i == newThreadCount - 1) ? currentMaxX : startX + chunkSize;
-            executor.execute(new RegionChecker(currentSeed, startX, endX, currentMinZ, currentMaxZ, currentMaxHeight,
-                    currentProcessedCount, currentResultCallback, currentCheckGeneration));
-        }
-        executor.shutdown();
-
-        // 恢复执行（不再暂停）
         isPaused = false;
     }
 
@@ -266,14 +275,12 @@ public class SearchCoords {
 
         @Override
         public void run() {
-            // 将 maxHeight 转为 int，供 check(...) 使用
             int maxHeightInt = (int) maxHeight;
 
             try {
-                for (int x = startX; x < endX && isRunning; x++) {
-                    for (int z = minZ; z < maxZ && isRunning; z++) {
-                        // 暂停时等待
-                        while (isPaused && isRunning) {
+                for (int x = startX; x < endX && isRunning && !restartRequested; x++) {
+                    for (int z = minZ; z < maxZ && isRunning && !restartRequested; z++) {
+                        while (isPaused && isRunning && !restartRequested) {
                             try {
                                 Thread.sleep(100);
                             } catch (InterruptedException e) {
@@ -281,23 +288,20 @@ public class SearchCoords {
                                 return;
                             }
                         }
-                        if (!isRunning) {
+                        if (!isRunning || restartRequested) {
                             break;
                         }
                         try {
                             CPos pos = swampHut.getInRegion(seed, x, z, rand);
-                            // 阶段1：检查噪声和群系条件
                             if (!SearchCoords.this.check(seed, 16 * pos.getX(), 16 * pos.getZ(), maxHeightInt)) {
                                 continue;
                             }
-                            // 阶段2：精确检查未生成结构时每一点的地表高度
                             int hutX = 16 * pos.getX();
                             int hutZ = 16 * pos.getZ();
                             Result estimated = checkHeight(seed, hutX, hutZ, mcVersion, worldPresetMode);
                             if (!(estimated.height <= maxHeight)) {
                                 continue;
                             }
-                            // 阶段3：真实生成后直接判断小屋是否生成以及真实生成高度并输出结果
                             if (worldPresetMode == WorldPresetMode.SINGLE_BIOME || !checkGeneration) {
                                 emitResultLine(estimated.toString(), resultCallback);
                             } else {
@@ -330,16 +334,13 @@ public class SearchCoords {
             try {
                 checkHeightByRealGen(pos, estimatedHeight, resultCallback);
             } catch (NoClassDefFoundError | ExceptionInInitializerError e) {
-                // 如果 SeedChecker 初始化失败（通常是 log4j 问题），跳过这个坐标，这不应该阻止程序继续运行
                 if (e.getCause() != null && e.getCause().getMessage() != null && e.getCause().getMessage().contains("No class provided")) {
-                    // 这是 log4j 的调用者查找问题，跳过这个坐标
                     return;
                 }
                 throw e;
             }
         }
 
-        // 仅在精确检查生成且非单群系时执行最后的精确生成检查：判断是否生成并微调小屋最终高度
         private void checkHeightByRealGen(CPos pos, Result estimatedHeight, Consumer<String> resultCallback) {
             int hutX = 16 * pos.getX();
             int hutZ = 16 * pos.getZ();
@@ -434,13 +435,12 @@ public class SearchCoords {
         int heightZ = z + 3;
 
         boolean isSingleBiome = worldPresetMode == WorldPresetMode.SINGLE_BIOME;
-        if (!isSingleBiome) { // 检查群系
+        if (!isSingleBiome) {
             double erosionSample = cache.erosion.sample((double) climateX / 4, 0, (double) climateZ / 4);
             if (erosionSample < 0.55) {
                 return false;
             }
             double temperature = cache.temperature.sample((double) climateX / 4, 0, (double) climateZ / 4);
-            // 1.18.2版本只检查温度不能小于-0.45，其他版本检查温度不能小于-0.45且不能大于0.2
             if (mcVersion == MCVersion.v1_18_2) {
                 if (temperature < -0.45) {
                     return false;
@@ -464,11 +464,9 @@ public class SearchCoords {
         if (Entrance(seed, heightX, 60, heightZ, worldPresetMode) >= 0) {
             return false;
         }
-        // 检查maxHeight本身
         if (Entrance2(seed, heightX, maxHeight, heightZ, worldPresetMode) >= 0 && Cheese(seed, heightX, maxHeight, heightZ, worldPresetMode) >= 0) {
             return false;
         }
-        // 0以下使用Entrance2
         for (int y = 0; y >= -40; y -= 10) {
             if (maxHeight < y) {
                 if (Entrance2(seed, heightX, y, heightZ, worldPresetMode) >= 0 && Cheese(seed, heightX, y, heightZ, worldPresetMode) >= 0) {
@@ -476,13 +474,12 @@ public class SearchCoords {
                 }
             }
         }
-        // 10-40使用Entrance（较复杂）
         for (int y = 10; y <= 40; y += 10) {
             if (Entrance(seed, heightX, y, heightZ, worldPresetMode) >= 0 && Cheese(seed, heightX, y, heightZ, worldPresetMode) >= 0) {
                 return false;
             }
         }
-        if (!isSingleBiome && cache.continentalness.sample((double) climateX / 4, 0, (double) climateZ / 4) < -0.11) { // 检查大陆性
+        if (!isSingleBiome && cache.continentalness.sample((double) climateX / 4, 0, (double) climateZ / 4) < -0.11) {
             return false;
         }
         for (int y = maxHeight; y <= 60; y += 10) {
@@ -610,7 +607,7 @@ public class SearchCoords {
         WorldNoiseCache cache = getThreadResources(worldSeed, worldPresetMode).noise;
         double a = 4 * cache.caveLayer.sample(x, y * 8, z) * cache.caveLayer.sample(x, y * 8, z);
         double b = MathHelper.clamp((0.27 + cache.caveCheese.sample(x, y * 0.6666666666666666, z)), -1, 1);
-        return a + b;//Actually there still need to add a function about sloped_cheese, but sloped_cheese is too complex and IDK how to calculate it.
+        return a + b;
     }
 
     public static double Entrance2(long worldSeed, int x, int y, int z, WorldPresetMode worldPresetMode) {
